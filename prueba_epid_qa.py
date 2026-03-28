@@ -472,6 +472,44 @@ def run_window(beam_set, machine):
     window = MyWindow(beam_set, machine)
 
 
+def run_epid_qa_automatic():
+    selected_sid = "100 SID"
+    collimator_angle = ''
+    selected_flood_field_method_index = 0  # None
+
+    try:
+        export_path = get_patient_export_path(patient)
+    except Exception as exc:
+        MessageBox.Show(
+            u'No se pudo crear/usar la carpeta de exportación por NHC.\n{}'.format(exc),
+            'Cannot run EPID QA'
+        )
+        return
+
+    print('****************************')
+    print('     Computation started    ')
+    print('****************************')
+
+    isocenter = isocenter_values[selected_sid]
+    sid = sid_values[selected_sid]
+    machine_sad = machine.Physics.SourceAxisDistance
+    target = epid_qa.ray_epid_qa_utils if hasattr(epid_qa, "ray_epid_qa_utils") else epid_qa
+
+    target.compute_epid_qa_response(
+        patient, plan, beam_set, grid_resolution, phantom_name, phantom_id,
+        collimator_angle, sid, isocenter, detector_plane_y, machine_sad, ui,
+        export_path, flood_field_method[selected_flood_field_method_index],
+        flood_field_beam_quality_id[selected_flood_field_method_index]
+    )
+
+    invert_exported_dicoms(export_path)
+
+    print('****************************')
+    print('       Export finished      ')
+    print('****************************')
+    MessageBox.Show('Export finished', 'Export finished')
+
+
 def indent(elem, level=0):
     i = "\n" + level * "  "
     j = "\n" + (level - 1) * "  "
@@ -1000,7 +1038,4 @@ xaml = r"""<Window
 
 xr = XmlReader.Create(StringReader(xaml))
 
-thread = Thread(ThreadStart(lambda: run_window(beam_set, machine)))
-thread.SetApartmentState(ApartmentState.STA)
-thread.Start()
-thread.Join()
+run_epid_qa_automatic()
