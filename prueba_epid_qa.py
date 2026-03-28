@@ -25,6 +25,7 @@ import numpy as np
 import pydicom
 
 LOCAL_UTILS = r"C:\Scripts\ray_epid_qa_utils.py"
+VERIFIC_PACIENTES_ROOT = r"W:\Radiofisica\Fisica\MEDIDAS\verific_pacientes"
 
 spec = importlib.util.spec_from_file_location("ray_epid_qa_utils_local", LOCAL_UTILS)
 epid_qa = importlib.util.module_from_spec(spec)
@@ -46,6 +47,23 @@ def invert_exported_dicoms(export_path):
         ds.PixelRepresentation = 0
         ds.PhotometricInterpretation = "MONOCHROME2"
         ds.save_as(fp)
+
+
+def get_patient_nhc(patient_obj):
+    possible_attrs = ["PatientID", "PatientId", "MedicalRecordNumber", "PatientNumber"]
+    for attr in possible_attrs:
+        value = getattr(patient_obj, attr, None)
+        if value:
+            return str(value).strip()
+    raise ValueError("No se pudo obtener el NHC del paciente.")
+
+
+def get_patient_export_path(patient_obj):
+    nhc = get_patient_nhc(patient_obj)
+    export_path = os.path.join(VERIFIC_PACIENTES_ROOT, nhc)
+    if not os.path.exists(export_path):
+        os.makedirs(export_path)
+    return export_path
 
 # Global and user defined variables
 machine_db = get_current('MachineDB')
@@ -401,9 +419,13 @@ class MyWindow(Window):
                         return
         else:
             collimator_angle = ''
-        export_path = self.export_path_combo_box.SelectedItem
-        if export_path == '':
-            MessageBox.Show('No export path selected', 'Cannot run EPID QA')
+        try:
+            export_path = get_patient_export_path(patient)
+        except Exception as exc:
+            MessageBox.Show(
+                u'No se pudo crear/usar la carpeta de exportación por NHC.\n{}'.format(exc),
+                'Cannot run EPID QA'
+            )
             return
 
         self.window.Hide()
