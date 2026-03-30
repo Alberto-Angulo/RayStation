@@ -482,22 +482,35 @@ def export_qa_plan_to_aria(verification_plan):
     patient.Save()
 
     qa_beam_set = verification_plan.BeamSet
-    qa_beam_set_id = qa_beam_set.DicomPlanLabel
-    export_attempts = [
-        ("ScriptableDicomExport_BeamSetLabel", dict(
-            ExportFolderPath=qa_export_root,
-            BeamSets=[qa_beam_set_id],
-            PhysicalBeamSetDoseForBeamSets=[qa_beam_set_id],
-            PhysicalBeamDosesForBeamSets=[qa_beam_set_id],
-            IgnorePreConditionWarnings=True
-        )),
-        ("ScriptableDicomExport_BeamSetLabel_NoFlags", dict(
-            ExportFolderPath=qa_export_root,
-            BeamSets=[qa_beam_set_id],
-            PhysicalBeamSetDoseForBeamSets=[qa_beam_set_id],
-            PhysicalBeamDosesForBeamSets=[qa_beam_set_id],
-        )),
-    ]
+    plan_name_candidates = [plan.Name]
+    if hasattr(verification_plan, "ForTreatmentPlan") and verification_plan.ForTreatmentPlan is not None:
+        plan_name_candidates.append(verification_plan.ForTreatmentPlan.Name)
+    plan_name_candidates = [pn for i, pn in enumerate(plan_name_candidates) if pn and pn not in plan_name_candidates[:i]]
+
+    beam_set_label = qa_beam_set.DicomPlanLabel
+    beam_set_identities = [beam_set_label] + ["{}:{}".format(pn, beam_set_label) for pn in plan_name_candidates]
+
+    export_attempts = []
+    for beam_set_identity in beam_set_identities:
+        export_attempts.append((
+            "ScriptableDicomExport_{}".format(beam_set_identity),
+            dict(
+                ExportFolderPath=qa_export_root,
+                BeamSets=[beam_set_identity],
+                PhysicalBeamSetDoseForBeamSets=[beam_set_identity],
+                PhysicalBeamDosesForBeamSets=[beam_set_identity],
+                IgnorePreConditionWarnings=True
+            )
+        ))
+        export_attempts.append((
+            "ScriptableDicomExport_{}_NoFlags".format(beam_set_identity),
+            dict(
+                ExportFolderPath=qa_export_root,
+                BeamSets=[beam_set_identity],
+                PhysicalBeamSetDoseForBeamSets=[beam_set_identity],
+                PhysicalBeamDosesForBeamSets=[beam_set_identity],
+            )
+        ))
 
     errors = []
     for attempt_name, kwargs in export_attempts:
@@ -509,7 +522,9 @@ def export_qa_plan_to_aria(verification_plan):
 
     raise Exception(
         'No se pudo exportar el QA plan (RT Plan + RT Dose) a {}.\n'
-        'Errores de intentos:\n- {}'.format(qa_export_root, '\n- '.join(errors))
+        'BeamSet.DicomPlanLabel={}\n'
+        'Plan names usados={}\n'
+        'Errores de intentos:\n- {}'.format(qa_export_root, beam_set_label, plan_name_candidates, '\n- '.join(errors))
     )
 
 
