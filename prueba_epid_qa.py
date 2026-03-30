@@ -24,7 +24,7 @@ import importlib.util
 import numpy as np
 import pydicom
 
-LOCAL_UTILS = r"C:\Scripts\ray_epid_qa_utils.py"
+LOCAL_UTILS = r"C:\Program Files\RaySearch Laboratories\RayStation 2024B\ScriptClient\EPID QA\ray_epid_qa_utils.py"
 VERIFIC_PACIENTES_ROOT = r"W:\Radiofisica\Fisica\MEDIDAS\verific_pacientes"
 
 spec = importlib.util.spec_from_file_location("ray_epid_qa_utils_local", LOCAL_UTILS)
@@ -478,28 +478,24 @@ def export_qa_plan_to_aria(verification_plan):
     if not os.path.exists(qa_export_root):
         os.makedirs(qa_export_root)
 
+    # RayStation requires pending modifications to be saved before DICOM export.
+    patient.Save()
+
     qa_beam_set = verification_plan.BeamSet
     qa_beam_set_id = qa_beam_set.DicomPlanLabel
     export_attempts = [
-        ("ScriptableDicomExport_ObjectRefs", dict(
-            ExportFolderPath=qa_export_root,
-            BeamSets=[qa_beam_set],
-            PhysicalBeamSetDoseForBeamSets=[qa_beam_set],
-            PhysicalBeamDosesForBeamSets=[qa_beam_set],
-            IgnorePreConditionWarnings=True
-        )),
-        ("ScriptableDicomExport_ObjectRefs_NoFlags", dict(
-            ExportFolderPath=qa_export_root,
-            BeamSets=[qa_beam_set],
-            PhysicalBeamSetDoseForBeamSets=[qa_beam_set],
-            PhysicalBeamDosesForBeamSets=[qa_beam_set],
-        )),
         ("ScriptableDicomExport_BeamSetLabel", dict(
             ExportFolderPath=qa_export_root,
             BeamSets=[qa_beam_set_id],
             PhysicalBeamSetDoseForBeamSets=[qa_beam_set_id],
             PhysicalBeamDosesForBeamSets=[qa_beam_set_id],
             IgnorePreConditionWarnings=True
+        )),
+        ("ScriptableDicomExport_BeamSetLabel_NoFlags", dict(
+            ExportFolderPath=qa_export_root,
+            BeamSets=[qa_beam_set_id],
+            PhysicalBeamSetDoseForBeamSets=[qa_beam_set_id],
+            PhysicalBeamDosesForBeamSets=[qa_beam_set_id],
         )),
     ]
 
