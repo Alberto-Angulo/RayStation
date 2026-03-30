@@ -69,6 +69,7 @@ def get_patient_export_path(patient_obj):
 machine_db = get_current('MachineDB')
 ui = get_current('ui')
 patient = get_current('Patient')
+case = get_current('Case')
 beam_set = get_current('BeamSet')
 plan = get_current('Plan')
 machine = machine_db.GetTreatmentMachine(machineName=beam_set.MachineReference.MachineName, lockMode=None)
@@ -472,6 +473,43 @@ def run_window(beam_set, machine):
     window = MyWindow(beam_set, machine)
 
 
+def export_qa_plan_to_aria(verification_plan):
+    qa_export_root = r"\\srvvariadicom\Dosimetrias"
+    if not os.path.exists(qa_export_root):
+        os.makedirs(qa_export_root)
+
+    qa_beam_set = verification_plan.BeamSet
+    export_attempts = [
+        ("ScriptableDicomExport_IgnorePreConditionWarnings", dict(
+            ExportFolderPath=qa_export_root,
+            BeamSets=[qa_beam_set],
+            PhysicalBeamSetDoseForBeamSets=[qa_beam_set],
+            PhysicalBeamDosesForBeamSets=[qa_beam_set],
+            IgnorePreConditionWarnings=True
+        )),
+        ("ScriptableDicomExport_IgnoreWarnings", dict(
+            ExportFolderPath=qa_export_root,
+            BeamSets=[qa_beam_set],
+            PhysicalBeamSetDoseForBeamSets=[qa_beam_set],
+            PhysicalBeamDosesForBeamSets=[qa_beam_set],
+            IgnoreWarnings=True
+        )),
+    ]
+
+    last_error = None
+    for _, kwargs in export_attempts:
+        try:
+            case.ScriptableDicomExport(**kwargs)
+            return qa_export_root
+        except Exception as exc:
+            last_error = exc
+
+    raise Exception(
+        'No se pudo exportar el QA plan (RT Plan + RT Dose) a {}.\n'
+        'Último error: {}'.format(qa_export_root, last_error)
+    )
+
+
 def run_epid_qa_automatic():
     selected_sid = "100 SID"
     collimator_angle = ''
@@ -495,6 +533,8 @@ def run_epid_qa_automatic():
     machine_sad = machine.Physics.SourceAxisDistance
     target = epid_qa.ray_epid_qa_utils if hasattr(epid_qa, "ray_epid_qa_utils") else epid_qa
 
+    qa_count_before = plan.VerificationPlans.Count
+
     target.compute_epid_qa_response(
         patient, plan, beam_set, grid_resolution, phantom_name, phantom_id,
         collimator_angle, sid, isocenter, detector_plane_y, machine_sad, ui,
@@ -503,6 +543,14 @@ def run_epid_qa_automatic():
     )
 
     invert_exported_dicoms(export_path)
+
+    qa_count_after = plan.VerificationPlans.Count
+    if qa_count_after > qa_count_before:
+        qa_plan = plan.VerificationPlans[qa_count_after - 1]
+        aria_export_path = export_qa_plan_to_aria(qa_plan)
+        print('QA RT Plan/RT Dose exportado en: {}'.format(aria_export_path))
+    else:
+        print('No se encontró un nuevo QA plan para exportar a ARIA.')
 
     print('****************************')
     print('       Export finished      ')
