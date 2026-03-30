@@ -479,34 +479,41 @@ def export_qa_plan_to_aria(verification_plan):
         os.makedirs(qa_export_root)
 
     qa_beam_set = verification_plan.BeamSet
+    qa_beam_set_id = qa_beam_set.DicomPlanLabel
     export_attempts = [
-        ("ScriptableDicomExport_IgnorePreConditionWarnings", dict(
+        ("ScriptableDicomExport_ObjectRefs", dict(
             ExportFolderPath=qa_export_root,
             BeamSets=[qa_beam_set],
             PhysicalBeamSetDoseForBeamSets=[qa_beam_set],
             PhysicalBeamDosesForBeamSets=[qa_beam_set],
             IgnorePreConditionWarnings=True
         )),
-        ("ScriptableDicomExport_IgnoreWarnings", dict(
+        ("ScriptableDicomExport_ObjectRefs_NoFlags", dict(
             ExportFolderPath=qa_export_root,
             BeamSets=[qa_beam_set],
             PhysicalBeamSetDoseForBeamSets=[qa_beam_set],
             PhysicalBeamDosesForBeamSets=[qa_beam_set],
-            IgnoreWarnings=True
+        )),
+        ("ScriptableDicomExport_BeamSetLabel", dict(
+            ExportFolderPath=qa_export_root,
+            BeamSets=[qa_beam_set_id],
+            PhysicalBeamSetDoseForBeamSets=[qa_beam_set_id],
+            PhysicalBeamDosesForBeamSets=[qa_beam_set_id],
+            IgnorePreConditionWarnings=True
         )),
     ]
 
-    last_error = None
-    for _, kwargs in export_attempts:
+    errors = []
+    for attempt_name, kwargs in export_attempts:
         try:
             case.ScriptableDicomExport(**kwargs)
             return qa_export_root
         except Exception as exc:
-            last_error = exc
+            errors.append("{}: {}".format(attempt_name, exc))
 
     raise Exception(
         'No se pudo exportar el QA plan (RT Plan + RT Dose) a {}.\n'
-        'Último error: {}'.format(qa_export_root, last_error)
+        'Errores de intentos:\n- {}'.format(qa_export_root, '\n- '.join(errors))
     )
 
 
@@ -547,8 +554,13 @@ def run_epid_qa_automatic():
     qa_count_after = plan.VerificationPlans.Count
     if qa_count_after > qa_count_before:
         qa_plan = plan.VerificationPlans[qa_count_after - 1]
-        aria_export_path = export_qa_plan_to_aria(qa_plan)
-        print('QA RT Plan/RT Dose exportado en: {}'.format(aria_export_path))
+        try:
+            aria_export_path = export_qa_plan_to_aria(qa_plan)
+            print('QA RT Plan/RT Dose exportado en: {}'.format(aria_export_path))
+        except Exception as exc:
+            warning_msg = u'No se pudo exportar automáticamente QA RT Plan/RT Dose.\n{}'.format(exc)
+            print(warning_msg)
+            MessageBox.Show(warning_msg, 'QA export warning')
     else:
         print('No se encontró un nuevo QA plan para exportar a ARIA.')
 
