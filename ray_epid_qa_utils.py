@@ -7,7 +7,8 @@ import numpy as np
 
 def compute_epid_qa_response(patient, plan, beam_set, grid_resolution, phantom_name, phantom_id,
                              collimator_angle, sid, isocenter, detector_plane_y, machine_sad, ui,
-                             dicom_save_folder, apply_flood_field, single_flood_field_beam_quality_id):
+                             dicom_save_folder, apply_flood_field, single_flood_field_beam_quality_id,
+                             export_absolute_rt_dose=True):
 
     epid_response_options = {
         'PhantomName': phantom_name,
@@ -35,8 +36,37 @@ def compute_epid_qa_response(patient, plan, beam_set, grid_resolution, phantom_n
     dicom_files = prepare_dicom_files(patient, beam_set, collimator_angle, sid, grid_resolution, machine_sad, ui)
     export_dicom(patient.Name, plan.Name,  beam_set, dicom_save_folder,dicom_files, dose_planes)
 
+    if export_absolute_rt_dose:
+        export_qa_dose_dicom(patient, plan, dicom_save_folder)
 
 
+
+
+
+def export_qa_dose_dicom(patient, plan, export_folder):
+    """
+    Exports RTDOSE from the latest EPID QA verification plan for absolute dose comparison in TPS.
+    """
+    qa_plan = plan.VerificationPlans[plan.VerificationPlans.Count - 1]
+    patient.Save()
+
+    try:
+        qa_plan.ScriptableQADicomExport(
+            ExportFolderPath=export_folder,
+            ExportBeamSet=True,
+            ExportBeamSetDose=True,
+            ExportBeamSetBeamDose=True
+        )
+        print("Absolute QA dose exported (RTDOSE): beam set + beam doses")
+    except SystemError:
+        qa_plan.ScriptableQADicomExport(
+            ExportFolderPath=export_folder,
+            ExportBeamSet=True,
+            ExportBeamSetDose=True,
+            ExportBeamSetBeamDose=True,
+            IgnorePreConditionWarnings=True
+        )
+        print("Absolute QA dose exported (RTDOSE) with precondition warnings ignored")
 def get_unique_qa_plan_name(plan, qa_base_name):
     """
     Checks the current names of QA plans in the current treatment plan and increases the name count to be unique
