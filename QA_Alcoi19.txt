@@ -1,0 +1,1152 @@
+"""
+SCRIPT INTEGRADO OPTIMIZADO - EXPORTADOR ARIA + EPID QA
+- Corrección de UIDs dinámicos (derivados del plan original)
+- Exportación separada: plan original ANTES del QA
+- Gestión de carpetas numeradas para verificaciones
+- Opción opcional para Octavius QA (por defecto NO)
+- Corrección de tasas de dosis en RTPLAN del QA EPID (600/1400 según calidad)
+"""
+import os
+import glob
+import numpy as np
+import pydicom
+import re
+import clr
+clr.AddReference("PresentationFramework")
+from System.Windows import MessageBox, Window, WindowStartupLocation
+from System.Windows.Controls import (
+    StackPanel,
+    TextBlock,
+    Button,
+    RadioButton,
+    GroupBox,
+    DockPanel,
+    Dock
+)
+from System.Windows import (
+    HorizontalAlignment,
+    VerticalAlignment,
+    Thickness,
+    FontWeights,
+    SizeToContent,
+    TextWrapping,
+)
+from System.Windows import ResizeMode
+
+from datetime import datetime
+from pydicom.dataset import Dataset
+from pydicom.sequence import Sequence
+from pydicom.uid import generate_uid
+from scipy.interpolate import RegularGridInterpolator
+from connect import *
+
+
+# ==================== CONFIGURACIÓN GENERAL ====================
+
+ARIA_PATH = r"\\srvvariadicom\Dosimetrias"
+VERIFIC_ROOT = r"W:\Radiofisica\Fisica\MEDIDAS\verific_pacientes"
+
+# Parámetros EPID QA
+PHANTOM_NAME = "EPID QA Varian"
+PHANTOM_ID = "Phantom"
+SID = 1000  # mm
+ISOCENTER = {'x': 0, 'y': 23, 'z': 25}
+DETECTOR_PLANE_Y = 23
+GRID_RESOLUTION = {'x': 0.2, 'y': 0.2, 'z': 0.2}
+COLLIMATOR_ANGLE = ''
+
+# Parámetros Octavius QA
+OCTAVIUS_PHANTOM_NAME = "OCTAVIUS 1500 TRUEBEAM"
+OCTAVIUS_PHANTOM_ID = "M00005"
+OCTAVIUS_ISOCENTER = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+
+# Tasas de dosis según calidad de haz
+DOSE_RATE_MAP = {'FFF': 1400, 'default': 600}
+
+DIMENS = None
+PATIENT_INFO = None
+
+# Cache de objetos de RayStation
+CURRENT_PATIENT = None
+CURRENT_PLAN = None
+CURRENT_BEAMSET = None
+CURRENT_CASE = None
+CURRENT_EXAM = None
+CURRENT_UI = None
+CURRENT_MACHINE = None
+
+# Opción Octavius (por defecto NO)
+CREATE_OCTAVIUS_QA = False
+
+# ==================== FUNCIONES COMUNES ====================
+
+def refresh_objects():
+    """Actualiza los objetos globales cacheados (se llama al inicio)"""
+    global CURRENT_PATIENT, CURRENT_PLAN, CURRENT_BEAMSET, CURRENT_CASE, CURRENT_EXAM, CURRENT_UI, CURRENT_MACHINE
+    CURRENT_PATIENT = get_current("Patient")
+    CURRENT_PLAN = get_current("Plan")
+    CURRENT_BEAMSET = get_current("BeamSet")
+    CURRENT_CASE = get_current("Case")
+    CURRENT_EXAM = get_current("Examination")
+    CURRENT_UI = get_current("ui")
+    machine_db = get_current("MachineDB")
+    if CURRENT_BEAMSET:
+        CURRENT_MACHINE = machine_db.GetTreatmentMachine(
+            machineName=CURRENT_BEAMSET.MachineReference.MachineName,
+            lockMode=None
+        )
+
+
+def save_all():
+    """Guarda una sola vez al final o cuando es estrictamente necesario"""
+    if CURRENT_PATIENT:
+        CURRENT_PATIENT.Save()
+        print("  💾 Paciente guardado")
+
+def set_progress(message):
+    try:
+        from connect import set_progress
+        set_progress(message)
+    except:
+        print(f"[PROGRESS] {message}")
+
+def get_patient_id():
+    for attr in ["PatientID", "PatientId", "MedicalRecordNumber", "PatientNumber"]:
+        val = getattr(CURRENT_PATIENT, attr, None)
+        if val:
+            return str(val)
+    raise Exception("No se encontró ID del paciente")
+
+def get_dose_rate_for_beam(beam):
+    """Determina la tasa de dosis según la calidad del haz (FFF=1400, convencional=600)"""
+    quality = beam.BeamQualityId
+    return DOSE_RATE_MAP['FFF'] if "FFF" in quality.upper() else DOSE_RATE_MAP['default']
+
+def derive_study_uid_from_plan_uid(plan_uid):
+    """Deriva el StudyUID a partir del PlanUID (eliminando el último componente)"""
+    if not plan_uid:
+        return None
+    parts = plan_uid.split('.')
+    if len(parts) > 1:
+        return '.'.join(parts[:-1])
+    return plan_uid
+
+def get_correct_study_uid():
+    """Obtiene el StudyUID correcto derivado del plan de tratamiento original"""
+    
+    # Opción 1: Del beam_set actual (si es el de tratamiento, no QA)
+    try:
+        if hasattr(CURRENT_BEAMSET, 'ModificationInfo') and hasattr(CURRENT_BEAMSET.ModificationInfo, 'DicomUID'):
+            beamset_name = CURRENT_BEAMSET.DicomPlanLabel
+            if "QA" not in beamset_name and "EPID" not in beamset_name:
+                plan_uid = CURRENT_BEAMSET.ModificationInfo.DicomUID
+                study_uid = derive_study_uid_from_plan_uid(plan_uid)
+                if study_uid:
+                    return study_uid
+    except Exception:
+        pass
+    
+    # Opción 2: Del plan actual (el de tratamiento, NO el QA)
+    try:
+        if hasattr(CURRENT_PLAN, 'ModificationInfo') and hasattr(CURRENT_PLAN.ModificationInfo, 'DicomUID'):
+            plan_name = CURRENT_PLAN.Name
+            if "QA" not in plan_name and "EPID" not in plan_name:
+                plan_uid = CURRENT_PLAN.ModificationInfo.DicomUID
+                study_uid = derive_study_uid_from_plan_uid(plan_uid)
+                if study_uid:
+                    return study_uid
+    except Exception:
+        pass
+    
+    # Opción 3: Buscar en otros beam sets del plan que no sean QA
+    try:
+        for bs in CURRENT_PLAN.BeamSets:
+            if hasattr(bs, 'ModificationInfo') and hasattr(bs.ModificationInfo, 'DicomUID'):
+                if "QA" not in bs.DicomPlanLabel and "EPID" not in bs.DicomPlanLabel:
+                    plan_uid = bs.ModificationInfo.DicomUID
+                    study_uid = derive_study_uid_from_plan_uid(plan_uid)
+                    if study_uid:
+                        return study_uid
+    except Exception:
+        pass
+    
+    # Fallback: usar el UID del beam_set actual como base
+    try:
+        if hasattr(CURRENT_BEAMSET, 'ModificationInfo') and hasattr(CURRENT_BEAMSET.ModificationInfo, 'DicomUID'):
+            plan_uid = CURRENT_BEAMSET.ModificationInfo.DicomUID
+            study_uid = derive_study_uid_from_plan_uid(plan_uid)
+            if study_uid:
+                return study_uid
+    except:
+        pass
+    
+    return generate_uid()
+
+def get_original_plan_uid():
+    """Obtiene el UID del plan de tratamiento ORIGINAL del paciente abierto"""
+    
+    # Opción 1: Del beam_set actual (si es el de tratamiento, no QA)
+    try:
+        if hasattr(CURRENT_BEAMSET, 'ModificationInfo') and hasattr(CURRENT_BEAMSET.ModificationInfo, 'DicomUID'):
+            beamset_name = CURRENT_BEAMSET.DicomPlanLabel
+            if "QA" not in beamset_name and "EPID" not in beamset_name:
+                return CURRENT_BEAMSET.ModificationInfo.DicomUID
+    except Exception:
+        pass
+    
+    # Opción 2: Del plan actual (el de tratamiento, NO el QA)
+    try:
+        if hasattr(CURRENT_PLAN, 'ModificationInfo') and hasattr(CURRENT_PLAN.ModificationInfo, 'DicomUID'):
+            plan_name = CURRENT_PLAN.Name
+            if "QA" not in plan_name and "EPID" not in plan_name:
+                return CURRENT_PLAN.ModificationInfo.DicomUID
+    except Exception:
+        pass
+    
+    # Opción 3: Buscar en otros beam sets del plan
+    try:
+        for bs in CURRENT_PLAN.BeamSets:
+            if hasattr(bs, 'ModificationInfo') and hasattr(bs.ModificationInfo, 'DicomUID'):
+                if "QA" not in bs.DicomPlanLabel and "EPID" not in bs.DicomPlanLabel:
+                    return bs.ModificationInfo.DicomUID
+    except Exception:
+        pass
+    
+    # Fallback: usar el UID del beam_set actual aunque sea de QA
+    try:
+        if hasattr(CURRENT_BEAMSET, 'ModificationInfo') and hasattr(CURRENT_BEAMSET.ModificationInfo, 'DicomUID'):
+            return CURRENT_BEAMSET.ModificationInfo.DicomUID
+    except:
+        pass
+    return generate_uid()
+
+# ==================== VENTANA DE CONFIRMACIÓN OCTAVIUS ====================
+
+def show_octavius_confirmation():
+    """Muestra ventana de confirmación para crear/exportar Octavius QA (por defecto NO)"""
+    global CREATE_OCTAVIUS_QA
+
+    # Crear ventana
+    window = Window()
+    window.Title = "Exportador Integrado - Confirmación"
+    window.Width = 500
+    window.Height = 250
+    window.SizeToContent = SizeToContent.Height
+    window.WindowStartupLocation = WindowStartupLocation.CenterScreen
+    window.ResizeMode = ResizeMode.NoResize
+
+    # Layout principal
+    main_panel = StackPanel()
+    main_panel.Margin = Thickness(20)
+
+    # Título
+    title = TextBlock()
+    title.Text = "Creación de QA Octavius"
+    title.FontSize = 16
+    title.FontWeight = FontWeights.Bold
+    title.Margin = Thickness(0, 0, 0, 15)
+    title.HorizontalAlignment = HorizontalAlignment.Center
+    main_panel.Children.Add(title)
+
+    # Mensaje informativo
+    info_text = TextBlock()
+    info_text.Text = (
+        "¿Desea crear y exportar el plan de verificación Octavius 1500?\n\n"
+        "Seleccione 'Sí' para crear el QA Octavius.\n"
+        "Seleccione 'No' para continuar sin Octavius (solo EPID QA)."
+    )
+    info_text.TextWrapping = TextWrapping.Wrap
+    info_text.Margin = Thickness(0, 0, 0, 20)
+    main_panel.Children.Add(info_text)
+
+    # Grupo de radio buttons
+    group_box = GroupBox()
+    group_box.Header = "Opción"
+    group_box.Margin = Thickness(0, 0, 0, 20)
+
+    radio_panel = StackPanel()
+    radio_panel.Margin = Thickness(10, 5, 10, 5)
+
+    radio_no = RadioButton()
+    radio_no.Content = "No"
+    radio_no.IsChecked = True
+    radio_no.Margin = Thickness(0, 5, 0, 5)
+    radio_panel.Children.Add(radio_no)
+
+    radio_si = RadioButton()
+    radio_si.Content = "Sí"
+    radio_si.Margin = Thickness(0, 5, 0, 5)
+    radio_panel.Children.Add(radio_si)
+
+    group_box.Content = radio_panel
+    main_panel.Children.Add(group_box)
+
+    # Panel de botones
+    button_panel = DockPanel()
+    button_panel.Margin = Thickness(0, 10, 0, 0)
+
+    cancel_button = Button()
+    cancel_button.Content = "Cancelar"
+    cancel_button.Width = 100
+    cancel_button.Height = 30
+    cancel_button.HorizontalAlignment = HorizontalAlignment.Right
+    cancel_button.Margin = Thickness(5, 0, 0, 0)
+    cancel_button.Click += lambda s, e: window.Close()
+
+    ok_button = Button()
+    ok_button.Content = "Continuar"
+    ok_button.Width = 100
+    ok_button.Height = 30
+    ok_button.HorizontalAlignment = HorizontalAlignment.Right
+    ok_button.IsDefault = True
+
+    def on_ok_click(sender, event):
+        global CREATE_OCTAVIUS_QA
+        CREATE_OCTAVIUS_QA = (radio_si.IsChecked == True)
+        window.Close()
+
+    ok_button.Click += on_ok_click
+
+    button_panel.Children.Add(ok_button)
+    button_panel.Children.Add(cancel_button)
+
+    DockPanel.SetDock(ok_button, Dock.Right)
+    DockPanel.SetDock(cancel_button, Dock.Right)
+
+    main_panel.Children.Add(button_panel)
+
+    window.Content = main_panel
+    window.ShowDialog()
+
+# ==================== EXPORTADOR A ARIA/DICOM ====================
+
+def get_beam_set_list():
+    beam_sets = []
+    try:
+        for bs in CURRENT_PLAN.BeamSets:
+            beam_sets.append(bs.DicomPlanLabel)
+    except:
+        pass
+    if not beam_sets and CURRENT_BEAMSET:
+        beam_sets.append(CURRENT_BEAMSET.DicomPlanLabel)
+    # Filtrar beam sets de QA si los hay
+    beam_sets = [bs for bs in beam_sets if "QA" not in bs and "EPID" not in bs]
+    print(f"  Beam sets a exportar: {beam_sets}")
+    return beam_sets
+
+def export_original_plan_to_dicom():
+    """Exporta el plan de tratamiento ORIGINAL a la carpeta DICOM (antes de crear QA)"""
+    set_progress('Exportando plan original a DICOM...')
+    print("\n📤 Exportando plan original a DICOM...")
+    
+    try:
+        CURRENT_CASE.ScriptableDicomExport(
+            ExportFolderPath=ARIA_PATH,
+            Examinations=[CURRENT_EXAM.Name],
+            RtStructureSetsForExaminations=[CURRENT_EXAM.Name],
+            BeamSets=[f"{CURRENT_PLAN.Name}:{CURRENT_BEAMSET.DicomPlanLabel}"],
+            PhysicalBeamSetDoseForBeamSets=[f"{CURRENT_PLAN.Name}:{CURRENT_BEAMSET.DicomPlanLabel}"],
+            IgnorePreConditionWarnings=True
+        )
+        set_progress('✅ Plan original, CT y estructuras exportados a DICOM')
+        print("  ✅ Plan original, CT y estructuras exportados a DICOM")
+        return True
+    except Exception as e:
+        error_msg = str(e)
+        if "Duplicate" in error_msg:
+            set_progress('⚠️ Elemento duplicado en DICOM')
+            print("  ⚠️ Algunos elementos ya existían en DICOM")
+        else:
+            set_progress(f'❌ Error: {error_msg}')
+            print(f"  ❌ Error: {error_msg}")
+        return False
+
+def export_to_visionrt(beam_sets):
+    set_progress('Exportando a VisionRT...')
+    print("\n📤 Exportando a VisionRT...")
+    for bs_label in beam_sets:
+        try:
+            CURRENT_CASE.ScriptableDicomExport(
+                Connection={"Title": "AlignRT6"},
+                RtStructureSetsForExaminations=[CURRENT_EXAM.Name],
+                BeamSets=[f"{CURRENT_PLAN.Name}:{bs_label}"],
+                IgnorePreConditionWarnings=True
+            )
+            print(f"  ✅ {bs_label} -> VisionRT")
+        except Exception as e:
+            print(f"  ⚠️ {bs_label}: {e}")
+    set_progress('✅ VisionRT procesado')
+
+def export_to_pacs(beam_sets):
+    set_progress('Exportando a PACS...')
+    print("\n📤 Exportando a PACS...")
+    
+    if not beam_sets:
+        print("  ⚠️ No hay beam sets para exportar a PACS")
+        set_progress('⚠️ No hay beam sets para PACS')
+        return
+    
+    # Configuración de PACS
+    pacs_connection = {"Title": "PACS21"}
+    
+    # Exportar cada componente por separado para identificar errores
+    for bs_label in beam_sets:
+        beamset_ref = f"{CURRENT_PLAN.Name}:{bs_label}"
+        print(f"\n  Procesando beam set: {bs_label}")
+        
+        # 1. Exportar CT
+        try:
+            print(f"    📤 Exportando CT...")
+            CURRENT_CASE.ScriptableDicomExport(
+                Connection=pacs_connection,
+                Examinations=[CURRENT_EXAM.Name],
+                IgnorePreConditionWarnings=True
+            )
+            print(f"    ✅ CT exportado")
+        except Exception as e:
+            print(f"    ❌ Error exportando CT: {e}")
+            set_progress(f'❌ Error CT: {str(e)[:50]}')
+            # Continuar con el resto
+        
+        # 2. Exportar Estructuras
+        try:
+            print(f"    📤 Exportando estructuras...")
+            CURRENT_CASE.ScriptableDicomExport(
+                Connection=pacs_connection,
+                RtStructureSetsForExaminations=[CURRENT_EXAM.Name],
+                IgnorePreConditionWarnings=True
+            )
+            print(f"    ✅ Estructuras exportadas")
+        except Exception as e:
+            print(f"    ❌ Error exportando estructuras: {e}")
+            set_progress(f'❌ Error Estructuras: {str(e)[:50]}')
+        
+        # 3. Exportar Dosis
+        try:
+            print(f"    📤 Exportando dosis...")
+            CURRENT_CASE.ScriptableDicomExport(
+                Connection=pacs_connection,
+                PhysicalBeamSetDoseForBeamSets=[beamset_ref],
+                IgnorePreConditionWarnings=True
+            )
+            print(f"    ✅ Dosis exportada")
+        except Exception as e:
+            print(f"    ❌ Error exportando dosis: {e}")
+            set_progress(f'❌ Error Dosis: {str(e)[:50]}')
+        
+        # 4. Exportar Plan
+        try:
+            print(f"    📤 Exportando plan...")
+            CURRENT_CASE.ScriptableDicomExport(
+                Connection=pacs_connection,
+                BeamSets=[beamset_ref],
+                IgnorePreConditionWarnings=True
+            )
+            print(f"    ✅ Plan exportado")
+        except Exception as e:
+            print(f"    ❌ Error exportando plan: {e}")
+            set_progress(f'❌ Error Plan: {str(e)[:50]}')
+    
+    print("\n  ✅ Exportación PACS completada (con posibles errores parciales)")
+    set_progress('✅ PACS procesado')
+
+def create_octavius_qa():
+    set_progress('Creando QA Octavius 1500...')
+    print("\n🔬 Creando plan QA Octavius 1500...")
+    
+    existing_names = []
+    if CURRENT_PLAN.VerificationPlans:
+        for vp in CURRENT_PLAN.VerificationPlans:
+            try:
+                if hasattr(vp, 'BeamSet') and hasattr(vp.BeamSet, 'DicomPlanLabel'):
+                    existing_names.append(vp.BeamSet.DicomPlanLabel)
+            except:
+                pass
+    
+    max_num = 0
+    for name in existing_names:
+        match = re.match(r'QA-Plan(\d+)', name)
+        if match:
+            num = int(match.group(1))
+            if num > max_num:
+                max_num = num
+    candidate_num = max_num + 1
+    qa_name = f"QA-Plan{candidate_num}"
+    while qa_name in existing_names:
+        candidate_num += 1
+        qa_name = f"QA-Plan{candidate_num}"
+    
+    dose_grid = CURRENT_BEAMSET.GetDoseGrid()
+    voxel_size = dose_grid.VoxelSize.x
+    print(f"  Nombre: {qa_name}, Isocentro: {OCTAVIUS_ISOCENTER}, Voxel: {voxel_size} mm")
+    
+    try:
+        CURRENT_BEAMSET.CreateQAPlan(
+            PhantomName=OCTAVIUS_PHANTOM_NAME,
+            PhantomId=OCTAVIUS_PHANTOM_ID,
+            QAPlanName=qa_name,
+            IsoCenter=OCTAVIUS_ISOCENTER,
+            DoseGrid={'x': voxel_size, 'y': voxel_size, 'z': voxel_size},
+            GantryAngle=None,
+            CollimatorAngle=None,
+            CouchRotationAngle=0,
+            ComputeDoseWhenPlanIsCreated=True,
+            RemoveCompensators=False,
+            EnableDynamicTracking=False
+        )
+        save_all()
+        set_progress(f'✅ QA Octavius creado: {qa_name}')
+        print(f"  ✅ QA creado: {qa_name}")
+        return qa_name, candidate_num
+    except Exception as e:
+        set_progress(f'❌ Error: {e}')
+        print(f"  ❌ Error: {e}")
+        return None, None
+
+def export_octavius_qa_files(export_path):
+    set_progress('Exportando archivos QA Octavius...')
+    print("\n📁 Exportando archivos QA Octavius...")
+    os.makedirs(export_path, exist_ok=True)
+    print(f"  Ruta: {export_path}")
+    
+    try:
+        if CURRENT_PLAN.VerificationPlans and CURRENT_PLAN.VerificationPlans.Count > 0:
+            qa_plan = CURRENT_PLAN.VerificationPlans[CURRENT_PLAN.VerificationPlans.Count - 1]
+            qa_plan.ScriptableQADicomExport(
+                ExportFolderPath=export_path,
+                QaPlanIdentity="Phantom",
+                ExportBeamSet=True,
+                ExportExaminationStructureSet=True,
+                ExportBeamSetDose=False,
+                IgnorePreConditionWarnings=True
+            )
+            set_progress('✅ QA Octavius exportado')
+            print("  ✅ QA Octavius exportado")
+            return export_path
+    except Exception as e:
+        set_progress(f'❌ Error: {e}')
+        print(f"  ❌ Error: {e}")
+    return None
+
+def check_plan_approved():
+    try:
+        autorizadopor = CURRENT_BEAMSET.Review.ReviewerLoginName
+        if autorizadopor:
+            msg = (f"El plan ha sido aprobado por {autorizadopor}\n\n"
+                   f"Recuerda que se debe aprobar DESPUÉS de exportar.\n\n"
+                   f"¿Deseas continuar?")
+            return CURRENT_UI.MessageBoxYesNo(msg, "Plan Aprobado")
+    except:
+        pass
+    return True
+
+# ==================== EPID QA ====================
+
+def get_patient_dicom_info():
+    """Obtiene toda la información DICOM del paciente actual"""
+    global PATIENT_INFO
+    
+    # Obtener UIDs correctos del paciente abierto
+    study_uid = get_correct_study_uid()
+    plan_uid = get_original_plan_uid()
+    
+    info = {
+        'PatientID': CURRENT_PATIENT.PatientID,
+        'PatientName': CURRENT_PATIENT.Name,
+        'OriginalPlanSOPInstanceUID': plan_uid,
+        'FrameOfReferenceUID': CURRENT_BEAMSET.FrameOfReference if hasattr(CURRENT_BEAMSET, 'FrameOfReference') else '',
+        'RadiationMachineName': CURRENT_BEAMSET.MachineReference.MachineName if hasattr(CURRENT_BEAMSET, 'MachineReference') else '',
+        'StudyInstanceUID': study_uid
+    }
+    
+    # Obtener fechas usando la estructura disponible
+    try:
+        info['StudyDate'] = ''
+        info['StudyTime'] = ''
+        info['AccessionNumber'] = ''
+        info['StudyID'] = ''
+        info['ReferringPhysicianName'] = ''
+        
+        # Intentar obtener del examen si existe
+        if CURRENT_EXAM:
+            info['StudyDate'] = getattr(CURRENT_EXAM, 'StudyDate', '')
+            info['StudyTime'] = getattr(CURRENT_EXAM, 'StudyTime', '')
+            info['AccessionNumber'] = getattr(CURRENT_EXAM, 'AccessionNumber', '')
+            info['StudyID'] = getattr(CURRENT_EXAM, 'StudyID', '')
+    except:
+        pass
+    
+    # Patient Position
+    if hasattr(CURRENT_BEAMSET, 'PatientPosition'):
+        patient_pos = CURRENT_BEAMSET.PatientPosition
+        if 'Head' in patient_pos:
+            info['PatientPositionDICOM'] = 'HFS' if 'Supine' in patient_pos else 'HFP'
+        else:
+            info['PatientPositionDICOM'] = 'FFS' if 'Supine' in patient_pos else 'FFP'
+    else:
+        info['PatientPositionDICOM'] = 'HFS'
+    
+    PATIENT_INFO = info
+    return info
+
+def get_interpolated_dose(detector_plane_y, dosegrid, doses):
+    global DIMENS
+    DIMENS = doses[0].DoseValues.DoseData.shape
+    
+    voxel_center_xmin = dosegrid.Corner.x + dosegrid.VoxelSize.x / 2
+    voxel_center_ymin = dosegrid.Corner.y + dosegrid.VoxelSize.y / 2
+    voxel_center_zmin = dosegrid.Corner.z + dosegrid.VoxelSize.z / 2
+    voxel_center_xmax = voxel_center_xmin + (dosegrid.NrVoxels.x - 1) * dosegrid.VoxelSize.x
+    voxel_center_ymax = voxel_center_ymin + (dosegrid.NrVoxels.y - 1) * dosegrid.VoxelSize.y
+    voxel_center_zmax = voxel_center_zmin + (dosegrid.NrVoxels.z - 1) * dosegrid.VoxelSize.z
+    
+    xlin = np.linspace(voxel_center_xmin, voxel_center_xmax, dosegrid.NrVoxels.x)
+    ylin = np.linspace(voxel_center_ymin, voxel_center_ymax, dosegrid.NrVoxels.y)
+    zlin = np.linspace(voxel_center_zmin, voxel_center_zmax, dosegrid.NrVoxels.z)
+    
+    points = []
+    for z in np.flipud(zlin):
+        for x in xlin:
+            points.append([z, detector_plane_y, x])
+    points = np.array(points)
+    
+    dose_planes = []
+    for dose in doses:
+        interp_func = RegularGridInterpolator((zlin, ylin, xlin), dose.DoseValues.DoseData)
+        dose_planes.append(interp_func(points))
+    return np.array(dose_planes, dtype=object)
+
+def prepare_epid_dicom_files(patient_info, machine_sad):
+    pydicom_files = []
+    study_uid = patient_info.get('StudyInstanceUID', generate_uid())
+    series_uid = generate_uid()
+    original_plan_uid = patient_info.get('OriginalPlanSOPInstanceUID', generate_uid())
+    global DIMENS
+    
+    for i, beam in enumerate(CURRENT_BEAMSET.Beams):
+        this_collimator = COLLIMATOR_ANGLE if COLLIMATOR_ANGLE != '' else beam.Segments[0].CollimatorAngle
+        now = datetime.now()
+        
+        file_meta = Dataset()
+        file_meta.FileMetaInformationGroupLength = 188
+        file_meta.FileMetaInformationVersion = b'\x00\x01'
+        file_meta.MediaStorageSOPClassUID = '1.2.840.10008.5.1.4.1.1.481.1'
+        file_meta.MediaStorageSOPInstanceUID = generate_uid()
+        file_meta.TransferSyntaxUID = '1.2.840.10008.1.2'
+        file_meta.ImplementationClassUID = '1.2.246.352.70.2.1.160.3'
+        file_meta.ImplementationVersionName = 'DCIE 2.2'
+        
+        ds = Dataset()
+        ds.SpecificCharacterSet = 'ISO_IR 192'
+        ds.InstanceCreationDate = now.strftime('%Y%m%d')
+        ds.InstanceCreationTime = now.strftime('%H%M%S')
+        ds.SOPClassUID = '1.2.840.10008.5.1.4.1.1.481.1'
+        ds.SOPInstanceUID = generate_uid()
+        ds.PatientID = patient_info['PatientID']
+        ds.PatientName = patient_info['PatientName']
+        ds.StudyInstanceUID = study_uid
+        ds.FrameOfReferenceUID = patient_info['FrameOfReferenceUID']
+        ds.SeriesInstanceUID = series_uid
+        ds.SeriesNumber = "1"
+        ds.InstanceNumber = str(i + 1)
+        ds.StudyDate = patient_info.get('StudyDate', '')
+        ds.StudyTime = patient_info.get('StudyTime', '')
+        ds.ContentDate = now.strftime('%Y%m%d')
+        ds.ContentTime = now.strftime('%H%M%S')
+        ds.AccessionNumber = patient_info.get('AccessionNumber', '')
+        ds.ReferringPhysicianName = patient_info.get('ReferringPhysicianName', '')
+        ds.StudyID = patient_info.get('StudyID', '')
+        ds.Modality = 'RTIMAGE'
+        ds.ConversionType = 'DI'
+        ds.Manufacturer = 'RaySearch Laboratories'
+        ds.OperatorsName = ''
+        ds.ManufacturerModelName = 'RayStation'
+        ds.PatientIdentityRemoved = 'NO'
+        ds.SoftwareVersions = CURRENT_UI.GetApplicationVersion()
+        ds.PatientPosition = patient_info['PatientPositionDICOM']
+        ds.SamplesPerPixel = 1
+        ds.PhotometricInterpretation = 'MONOCHROME2'
+        
+        if DIMENS is not None:
+            ds.Rows = DIMENS[0]
+            ds.Columns = DIMENS[2]
+        else:
+            ds.Rows = 512
+            ds.Columns = 512
+        
+        ds.BitsAllocated = 16
+        ds.BitsStored = 16
+        ds.HighBit = 15
+        ds.PixelRepresentation = 0
+        ds.WindowCenter = "32768"
+        ds.WindowWidth = "65535"
+        ds.RescaleIntercept = "0.0"
+        ds.RescaleSlope = "1.0"
+        ds.RescaleType = 'GY'
+        ds.DoseUnits = 'GY'
+        ds.RTImageLabel = beam.Name
+        ds.RTImageDescription = f'{beam.BeamQualityId} MV'
+        ds.ReportedValuesOrigin = 'ACTUAL'
+        ds.RTImagePlane = 'NORMAL'
+        ds.XRayImageReceptorTranslation = [0.3623617, 0.7317194, 0]
+        ds.XRayImageReceptorAngle = "0.0"
+        ds.ImagePlanePixelSpacing = [GRID_RESOLUTION['x'] * 10, GRID_RESOLUTION['z'] * 10]
+        ds.RTImagePosition = [-249.9998, 230.4807]
+        ds.RadiationMachineName = patient_info['RadiationMachineName']
+        ds.RadiationMachineSAD = machine_sad * 10
+        ds.RTImageSID = str(SID)
+        ds.FractionNumber = "1"
+        ds.ImageType = "ORIGINAL\\PRIMARY\\PORTAL\\PREDICTED_DOSE"
+        
+        exposure_seq = Sequence()
+        exposure1 = Dataset()
+        exposure1.ReferencedFrameNumber = "1"
+        energy_match = re.search(r'(\d+)', beam.BeamQualityId)
+        kvp = int(energy_match.group(1)) * 1000 if energy_match else 6000
+        exposure1.KVP = str(kvp)
+        exposure1.MetersetExposure = f'{beam.BeamMU:.10f}'
+        
+        bl_device_seq = Sequence()
+        for device_type, positions in [('ASYMX', [-100, 100]), ('Y', [-100, 100])]:
+            bl_device = Dataset()
+            bl_device.RTBeamLimitingDeviceType = device_type
+            bl_device.NumberOfLeafJawPairs = "1"
+            bl_device.LeafJawPositions = positions
+            bl_device_seq.append(bl_device)
+        exposure1.BeamLimitingDeviceSequence = bl_device_seq
+        exposure1.NumberOfBlocks = "0"
+        exposure1.GantryAngle = "0"
+        exposure1.BeamLimitingDeviceAngle = f'{this_collimator:.12f}'
+        exposure1.PatientSupportAngle = "0.0"
+        exposure_seq.append(exposure1)
+        ds.ExposureSequence = exposure_seq
+        
+        ds.PrimaryDosimeterUnit = 'MU'
+        ds.GantryAngle = "0.0"
+        ds.BeamLimitingDeviceAngle = f'{this_collimator:.12f}'
+        ds.PatientSupportAngle = "0.0"
+        ds.TableTopVerticalPosition = "0.0"
+        ds.TableTopLongitudinalPosition = "0.0"
+        ds.TableTopLateralPosition = "0.0"
+        ds.IsocenterPosition = [0, 0, 0]
+        
+        refd_seq = Sequence()
+        refd_plan = Dataset()
+        refd_plan.ReferencedSOPClassUID = '1.2.840.10008.5.1.4.1.1.481.5'
+        refd_plan.ReferencedSOPInstanceUID = original_plan_uid
+        refd_seq.append(refd_plan)
+        ds.ReferencedRTPlanSequence = refd_seq
+        ds.ReferencedBeamNumber = beam.Number
+        ds.ReferencedFractionGroupNumber = "1"
+        ds.PixelData = None
+        ds.file_meta = file_meta
+        ds.is_implicit_VR = True
+        ds.is_little_endian = True
+        pydicom_files.append(ds)
+    
+    return pydicom_files, series_uid
+
+def export_epid_dicom(export_path, dicom_files, planar_doses):
+    set_progress('Exportando imágenes EPID (cGy, factor 0.0046)...')
+    print("\n📸 Exportando imágenes EPID...")
+    global DIMENS
+    if DIMENS is None:
+        set_progress('❌ Error: DIMENS no definido')
+        raise Exception("DIMENS no está definido.")
+    
+    nz = DIMENS[0]
+    nx = DIMENS[2]
+    factor = 0.01046  # sin filtro
+    
+    for i, dose_file in enumerate(dicom_files):
+        set_progress(f'Imagen {i+1}/{len(dicom_files)}: {dose_file.RTImageLabel}')
+        dose_gy = planar_doses[i]
+        dose_cgy = dose_gy * factor
+        max_dose = np.max(dose_cgy)
+        rescale_slope = max_dose / 65535.0 if max_dose != 0 else 1.0
+        pixel_values = (dose_cgy / rescale_slope).astype(np.uint16)
+        if np.max(pixel_values) > 65535:
+            pixel_values = np.clip(pixel_values, 0, 65535)
+        dose_file.PixelData = pixel_values.tobytes()
+        dose_file.RescaleSlope = str(rescale_slope)
+        dose_file.RescaleIntercept = "0.0"
+        dose_file.RescaleType = ''
+        dose_file.DoseUnits = ''
+        max_pixel = np.max(pixel_values)
+        min_pixel = np.min(pixel_values)
+        dose_file.WindowCenter = str((max_pixel + min_pixel) / 2.0)
+        dose_file.WindowWidth = str(max_pixel - min_pixel)
+        
+        center_idx = (nz // 2) * nx + (nx // 2)
+        dose_centro = dose_cgy[center_idx]
+        pixel_centro = pixel_values[center_idx]
+        
+        file_name = f'EPID_{dose_file.RTImageLabel}'
+        for char in '<>:"/\\|?*':
+            file_name = file_name.replace(char, '_')
+        output_path = os.path.join(export_path, f'{file_name}.dcm')
+        dose_file.save_as(output_path, write_like_original=False)
+        print(f"  ✅ {os.path.basename(output_path)} (centro {dose_centro:.4f} cGy)")
+    set_progress('✅ Imágenes EPID exportadas')
+
+def get_verification_export_path(patient_id):
+    patient_root = os.path.join(VERIFIC_ROOT, patient_id)
+    
+    if not os.path.exists(patient_root):
+        os.makedirs(patient_root)
+        return patient_root
+    
+    subfolders = []
+    for name in os.listdir(patient_root):
+        full_path = os.path.join(patient_root, name)
+        if os.path.isdir(full_path):
+            try:
+                subfolders.append(int(name))
+            except:
+                pass
+    
+    next_num = max(subfolders) + 1 if subfolders else 1
+    export_path = os.path.join(patient_root, str(next_num))
+    os.makedirs(export_path)
+    return export_path
+
+def patch_epid_rtplan_with_correct_dose_rates(patient_info):
+    """Parchea el RTPLAN del QA EPID con las tasas de dosis correctas (600/1400 según calidad)"""
+    set_progress('Parcheando RTPLAN del QA EPID con tasas correctas...')
+    print("\n📝 Parcheando RTPLAN del QA EPID...")
+    
+    # Buscar archivos RTPLAN en la carpeta ARIA
+    plans = glob.glob(os.path.join(ARIA_PATH, "RP*.dcm"))
+    
+    if not plans or not patient_info.get('StudyInstanceUID'):
+        print("  ⚠️ No se encontraron archivos RTPLAN")
+        return False
+    
+    # Seleccionar el archivo RTPLAN más reciente (debería ser el QA EPID)
+    latest_plan = max(plans, key=os.path.getctime)
+    print(f"  📄 Modificando: {os.path.basename(latest_plan)}")
+    
+    # Crear diccionario de tasas según calidad del haz del plan original
+    dose_rates = {}
+    print("  📊 Tasas a asignar según calidad de haz:")
+    for beam in CURRENT_BEAMSET.Beams:
+        rate = get_dose_rate_for_beam(beam)
+        dose_rates[beam.Number] = rate
+        print(f"    ✓ Haz {beam.Number} ({beam.Name}, {beam.BeamQualityId}): {rate} MU/min")
+    
+    try:
+        # Leer el archivo DICOM
+        ds = pydicom.dcmread(latest_plan)
+        modified = False
+        
+        # Actualizar StudyInstanceUID si es necesario
+        if hasattr(ds, 'StudyInstanceUID') and ds.StudyInstanceUID != patient_info.get('StudyInstanceUID'):
+            ds.StudyInstanceUID = patient_info.get('StudyInstanceUID')
+            modified = True
+            print(f"    ✓ StudyInstanceUID actualizado")
+        
+        # Actualizar PatientID si es necesario
+        if hasattr(ds, 'PatientID') and ds.PatientID != patient_info['PatientID']:
+            ds.PatientID = patient_info['PatientID']
+            modified = True
+            print(f"    ✓ PatientID actualizado")
+        
+        # Actualizar PatientName si es necesario
+        if hasattr(ds, 'PatientName') and ds.PatientName != patient_info['PatientName']:
+            ds.PatientName = patient_info['PatientName']
+            modified = True
+            print(f"    ✓ PatientName actualizado")
+        
+        # Actualizar etiqueta del plan
+        if hasattr(ds, 'RTPlanLabel') and ds.RTPlanLabel != "QA PORTAL":
+            ds.RTPlanLabel = "QA PORTAL"
+            modified = True
+            print(f"    ✏️ RTPlanLabel → QA PORTAL")
+        
+        # Recorrer los haces y asignar las tasas
+        if hasattr(ds, 'BeamSequence'):
+            for beam in ds.BeamSequence:
+                beam_num = getattr(beam, 'BeamNumber', None)
+                
+                if beam_num in dose_rates:
+                    tasa_correcta = dose_rates[beam_num]
+                    
+                    # Modificar DoseRate en el haz
+                    if hasattr(beam, 'DoseRate'):
+                        old_rate = beam.DoseRate
+                        if str(old_rate) != str(tasa_correcta):
+                            beam.DoseRate = tasa_correcta
+                            modified = True
+                            print(f"    ✏️ Haz {beam_num}: DoseRate {old_rate} → {tasa_correcta} MU/min")
+                    
+                    # Modificar DoseRateSet en los puntos de control
+                    if hasattr(beam, 'ControlPointSequence'):
+                        for cp_idx, cp in enumerate(beam.ControlPointSequence):
+                            if hasattr(cp, 'DoseRateSet'):
+                                old_rate = cp.DoseRateSet
+                                if str(old_rate) != str(tasa_correcta):
+                                    cp.DoseRateSet = tasa_correcta
+                                    modified = True
+                                    print(f"      ↻ Haz {beam_num} CP{cp_idx+1}: DoseRateSet {old_rate} → {tasa_correcta} MU/min")
+                    
+                    # Modificar SegmentDoseRate si existe (para IMRT)
+                    if hasattr(beam, 'BeamSegmentSequence'):
+                        for seg_idx, seg in enumerate(beam.BeamSegmentSequence):
+                            if hasattr(seg, 'SegmentDoseRate'):
+                                old_rate = seg.SegmentDoseRate
+                                if str(old_rate) != str(tasa_correcta):
+                                    seg.SegmentDoseRate = tasa_correcta
+                                    modified = True
+                                    print(f"      ↻ Haz {beam_num} Segmento {seg_idx+1}: SegmentDoseRate {old_rate} → {tasa_correcta} MU/min")
+                else:
+                    print(f"    ⚠️ Haz {beam_num}: no se encontró en el plan original")
+        
+        # Guardar los cambios
+        if modified:
+            ds.save_as(latest_plan)
+            print(f"\n  ✅ RTPLAN actualizado con tasas correctas (600/1400)")
+            set_progress('✅ Tasas de dosis corregidas en RTPLAN')
+            return True
+        else:
+            print(f"\n  ✓ RTPLAN ya tenía las tasas correctas")
+            return True
+            
+    except Exception as e:
+        print(f"  ❌ Error: {e}")
+        set_progress(f'❌ Error actualizando RTPLAN: {e}')
+        return False
+
+def patch_rtimages_with_correct_uid(export_path, patient_info):
+    """Parchea las imágenes RTImage exportadas con los UIDs correctos"""
+    set_progress('Parcheando RTImages...')
+    
+    rtimages = glob.glob(os.path.join(export_path, "EPID_*.dcm"))
+    
+    if not rtimages:
+        return
+    
+    correct_study_uid = patient_info.get('StudyInstanceUID')
+    correct_patient_id = patient_info['PatientID']
+    correct_patient_name = patient_info['PatientName']
+    correct_plan_uid = patient_info.get('OriginalPlanSOPInstanceUID')
+    
+    if not correct_study_uid:
+        return
+    
+    for f in rtimages:
+        try:
+            ds = pydicom.dcmread(f)
+            modified = False
+            
+            if hasattr(ds, 'StudyInstanceUID') and ds.StudyInstanceUID != correct_study_uid:
+                ds.StudyInstanceUID = correct_study_uid
+                modified = True
+            
+            if hasattr(ds, 'PatientID') and ds.PatientID != correct_patient_id:
+                ds.PatientID = correct_patient_id
+                modified = True
+            
+            if hasattr(ds, 'PatientName') and ds.PatientName != correct_patient_name:
+                ds.PatientName = correct_patient_name
+                modified = True
+            
+            if hasattr(ds, 'ReferencedRTPlanSequence') and correct_plan_uid:
+                for ref in ds.ReferencedRTPlanSequence:
+                    if hasattr(ref, 'ReferencedSOPInstanceUID'):
+                        if ref.ReferencedSOPInstanceUID != correct_plan_uid:
+                            ref.ReferencedSOPInstanceUID = correct_plan_uid
+                            modified = True
+            
+            if modified:
+                ds.save_as(f)
+        except Exception:
+            pass
+    
+    set_progress('✅ RTImages parcheadas')
+
+def create_epid_qa_plan():
+    set_progress('Creando plan EPID QA...')
+    print("\n🔬 Creando plan QA EPID Varian...")
+    
+    existing_names = []
+    if CURRENT_PLAN.VerificationPlans:
+        for vp in CURRENT_PLAN.VerificationPlans:
+            try:
+                if hasattr(vp, 'BeamSet') and hasattr(vp.BeamSet, 'DicomPlanLabel'):
+                    existing_names.append(vp.BeamSet.DicomPlanLabel)
+            except:
+                pass
+    
+    max_num = 0
+    for name in existing_names:
+        match = re.match(r'EPID QA (\d+)', name)
+        if match:
+            num = int(match.group(1))
+            if num > max_num:
+                max_num = num
+    candidate_num = max_num + 1
+    qa_name = f"EPID QA {candidate_num}"
+    while qa_name in existing_names:
+        candidate_num += 1
+        qa_name = f"EPID QA {candidate_num}"
+    
+    print(f"  Nombre: {qa_name}")
+    epid_options = {
+        'PhantomName': PHANTOM_NAME,
+        'PhantomId': PHANTOM_ID,
+        'DoseGrid': GRID_RESOLUTION,
+        'GantryAngle': 0,
+        'CouchRotationAngle': 0,
+        'ApplyFloodFieldCorrection': False,
+        'SingleFloodFieldBeamQualityId': None,
+        'FloodFieldFactor': 0.5,
+        'IsoCenter': ISOCENTER,
+        'QAPlanName': qa_name
+    }
+    if COLLIMATOR_ANGLE != '':
+        epid_options['CollimatorAngle'] = COLLIMATOR_ANGLE
+    
+    try:
+        CURRENT_BEAMSET.CreateEPIDResponse(**epid_options)
+        set_progress(f'✅ EPID QA creado: {qa_name}')
+        print(f"  ✅ Plan EPID QA creado: {qa_name}")
+    except Exception as e:
+        set_progress(f'❌ Error: {e}')
+        raise Exception(f'Error creando plan EPID QA: {e}')
+    
+    epid_qa_plan = CURRENT_PLAN.VerificationPlans[CURRENT_PLAN.VerificationPlans.Count - 1]
+    dose_grid = epid_qa_plan.BeamSet.FractionDose.InDoseGrid
+    dose_planes = get_interpolated_dose(DETECTOR_PLANE_Y, dose_grid,
+                                        epid_qa_plan.BeamSet.FractionDose.BeamDoses)
+    return dose_planes, dose_grid
+
+def export_epid_qa_plan(patient_info):
+    """Exporta SOLO el plan de QA EPID a la carpeta DICOM"""
+    set_progress('Exportando plan QA EPID...')
+    print("\n📦 Exportando plan QA EPID...")
+    
+    if CURRENT_PLAN.VerificationPlans.Count == 0:
+        set_progress('❌ No hay planes QA')
+        print("  ❌ No hay planes QA")
+        return
+    
+    qa_plan = CURRENT_PLAN.VerificationPlans[CURRENT_PLAN.VerificationPlans.Count - 1]
+    save_all()
+    
+    try:
+        qa_plan.ScriptableQADicomExport(
+            ExportFolderPath=ARIA_PATH,
+            ExportBeamSet=True,
+            ExportBeamSetDose=False,
+            ExportBeamSetBeamDose=False,
+            IgnorePreConditionWarnings=True
+        )
+        set_progress('✅ Plan QA EPID exportado')
+        print("  ✅ Plan QA EPID exportado")
+        
+        # Parchear el RTPLAN del QA EPID con las tasas correctas
+        patch_epid_rtplan_with_correct_dose_rates(patient_info)
+                
+    except Exception as e:
+        set_progress(f'❌ Error: {e}')
+        print(f"  ❌ Error: {e}")
+
+def show_message(msg, title="Exportador Integrado"):
+    MessageBox.Show(msg, title)
+
+# ==================== MAIN ====================
+
+def run():
+    set_progress('Iniciando script de RS a Aria...')
+    print("=" * 70)
+    print("SCRIPT - EXPORTADOR ARIA + EPID QA + QA OCTAVIUS")  
+    print("=" * 70)
+    
+    refresh_objects()
+    if not all([CURRENT_PATIENT, CURRENT_EXAM, CURRENT_CASE, CURRENT_PLAN, CURRENT_BEAMSET]):
+        set_progress('❌ Error: Faltan objetos seleccionados')
+        show_message("No se pudieron obtener todos los objetos necesarios.")
+        return
+    
+    print(f"\n📊 Datos del caso:")
+    print(f"  Paciente: {CURRENT_PATIENT.PatientID} - {CURRENT_PATIENT.Name}")
+    print(f"  Plan original: {CURRENT_PLAN.Name}")
+    print(f"  BeamSet: {CURRENT_BEAMSET.DicomPlanLabel}")
+    print(f"  Haces: {len(CURRENT_BEAMSET.Beams)}")
+    for beam in CURRENT_BEAMSET.Beams:
+        dr = get_dose_rate_for_beam(beam)
+        print(f"    - {beam.Name}: {beam.BeamQualityId}, MU: {beam.BeamMU}, Tasa asignada: {dr} MU/min")
+    
+    save_all()
+    
+    # ========== VENTANA DE CONFIRMACIÓN OCTAVIUS ==========
+    show_octavius_confirmation()
+    
+    if not check_plan_approved():
+        set_progress('Exportación cancelada')
+        show_message("Exportación cancelada.")
+        return
+    
+    beam_sets = get_beam_set_list()
+    
+    # ========== 1. EXPORTAR PLAN ORIGINAL A DICOM (ANTES DE CREAR QA) ==========
+    export_original_plan_to_dicom()
+    
+    # ========== 2. EXPORTACIÓN A VisionRT ==========
+    export_to_visionrt(beam_sets)
+    
+    # ========== 3. EXPORTACIÓN A PACS ==========
+    export_to_pacs(beam_sets)
+    
+    # ========== 4. OCTAVIUS QA (SOLO SI EL USUARIO LO SOLICITA) ==========
+    patient_id = get_patient_id()
+    export_path = get_verification_export_path(patient_id)
+    
+    qa_octavius_name = None
+    if CREATE_OCTAVIUS_QA:
+        qa_octavius_name, qa_octavius_idx = create_octavius_qa()
+        export_octavius_qa_files(export_path)
+    else:
+        print("\n⏭️ Omitiendo creación de QA Octavius (selección del usuario)")
+        set_progress('Omitiendo Octavius QA')
+    
+    # ========== 5. EPID QA ==========
+    # Obtener información DICOM del paciente (con UIDs correctos)
+    patient_info = get_patient_dicom_info()
+    
+    dose_planes, _ = create_epid_qa_plan()
+    save_all()
+    
+    print(f"\n📁 Exportando QA a: {export_path}")
+    
+    dicom_files, _ = prepare_epid_dicom_files(patient_info, CURRENT_MACHINE.Physics.SourceAxisDistance)
+    export_epid_dicom(export_path, dicom_files, dose_planes)
+    
+    # Parchear RTImages con UIDs correctos
+    patch_rtimages_with_correct_uid(export_path, patient_info)
+    
+    # Exportar SOLO el plan QA (no el original) - esto también parchea las tasas
+    export_epid_qa_plan(patient_info)
+    
+    octavius_msg = f"🔬 Octavius QA: {qa_octavius_name or 'No creado (opción del usuario)'}\n"
+    
+    mensaje = (
+        f"✅ EXPORTACIONES COMPLETADAS\n\n"
+        f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        f"📤 DICOM: Plan original, CT y estructuras\n"
+        f"📤 DICOM QA: Plan EPID QA (tasas: 600/1400 según calidad)\n"
+        f"📤 VisionRT: OK\n"
+        f"📤 PACS: CT, Estructuras, DRRs\n"
+        f"{octavius_msg}"
+        f"📸 EPID QA: Imágenes (cGy, factor 0.0046)\n"
+        f"📁 Carpeta QA: {export_path}"
+    )
+    
+    set_progress('Script finalizado')
+    show_message(mensaje, "EXPORTACIONES COMPLETADAS")
+    print("\n" + "=" * 70)
+    print(mensaje)
+    print("=" * 70)
+
+if __name__ == "__main__":
+    run()
