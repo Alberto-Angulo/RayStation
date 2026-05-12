@@ -4,7 +4,7 @@ SCRIPT INTEGRADO OPTIMIZADO - EXPORTADOR ARIA + EPID QA
 - Exportación separada: plan original ANTES del QA
 - Gestión de carpetas numeradas para verificaciones
 - Opción opcional para Octavius QA (por defecto NO)
-- Corrección de tasas de dosis en RTPLAN del QA EPID (600/1400 según calidad)
+- Corrección de tasas de dosis en RTPLAN de QA EPID/Octavius (600/1400 según calidad)
 """
 import os
 import glob
@@ -119,8 +119,62 @@ def get_patient_id():
 
 def get_dose_rate_for_beam(beam):
     """Determina la tasa de dosis según la calidad del haz (FFF=1400, convencional=600)"""
-    quality = beam.BeamQualityId
+    quality = getattr(beam, 'BeamQualityId', '') or ''
     return DOSE_RATE_MAP['FFF'] if "FFF" in quality.upper() else DOSE_RATE_MAP['default']
+
+def normalize_beam_number(beam_number):
+    """Convierte números de haz RayStation/pydicom a int para comparar de forma robusta."""
+    try:
+        return int(beam_number)
+    except Exception:
+        try:
+            return int(str(beam_number).strip())
+        except Exception:
+            return beam_number
+
+def build_dose_rate_map_from_current_beamset():
+    """Crea el mapa {BeamNumber: DoseRate} del plan original abierto."""
+    dose_rates = {}
+    print("  📊 Tasas a asignar según calidad de haz:")
+    for beam in CURRENT_BEAMSET.Beams:
+        beam_number = normalize_beam_number(beam.Number)
+        rate = get_dose_rate_for_beam(beam)
+        dose_rates[beam_number] = rate
+        print(f"    ✓ Haz {beam.Number} ({beam.Name}, {beam.BeamQualityId}): {rate} MU/min")
+    return dose_rates
+
+def get_new_or_latest_rtplan(export_path, previous_plans=None, expected_plan_label=None):
+    """Devuelve el RTPLAN nuevo/más probable de una exportación QA."""
+    plans = glob.glob(os.path.join(export_path, "RP*.dcm"))
+    if previous_plans is not None:
+        previous_plans = set(previous_plans)
+        new_plans = [plan for plan in plans if plan not in previous_plans]
+        if new_plans:
+            plans = new_plans
+
+    if expected_plan_label:
+        matching_plans = []
+        for plan in plans:
+            try:
+                ds = pydicom.dcmread(plan, stop_before_pixels=True)
+                if getattr(ds, 'RTPlanLabel', '') == expected_plan_label:
+                    matching_plans.append(plan)
+            except Exception:
+                pass
+        if matching_plans:
+            plans = matching_plans
+
+    if not plans:
+        return None
+    return max(plans, key=os.path.getctime)
+
+def set_dataset_value_if_needed(dataset, attr_name, value):
+    """Asigna un valor DICOM aunque el atributo no exista y devuelve si hubo cambio."""
+    old_value = getattr(dataset, attr_name, None)
+    if old_value is None or str(old_value) != str(value):
+        setattr(dataset, attr_name, value)
+        return True, old_value
+    return False, old_value
 
 def derive_study_uid_from_plan_uid(plan_uid):
     """Deriva el StudyUID a partir del PlanUID (eliminando el último componente)"""
@@ -503,7 +557,7 @@ def create_octavius_qa():
         print(f"  ❌ Error: {e}")
         return None, None
 
-def export_octavius_qa_files(export_path):
+def export_octavius_qa_files(export_path, patient_info):
     set_progress('Exportando archivos QA Octavius...')
     print("\n📁 Exportando archivos QA Octavius...")
     os.makedirs(export_path, exist_ok=True)
@@ -511,7 +565,9 @@ def export_octavius_qa_files(export_path):
     
     try:
         if CURRENT_PLAN.VerificationPlans and CURRENT_PLAN.VerificationPlans.Count > 0:
+            previous_plans = glob.glob(os.path.join(export_path, "RP*.dcm"))
             qa_plan = CURRENT_PLAN.VerificationPlans[CURRENT_PLAN.VerificationPlans.Count - 1]
+            qa_plan_label = getattr(qa_plan.BeamSet, 'DicomPlanLabel', None)
             qa_plan.ScriptableQADicomExport(
                 ExportFolderPath=export_path,
                 QaPlanIdentity="Phantom",
@@ -522,6 +578,13 @@ def export_octavius_qa_files(export_path):
             )
             set_progress('✅ QA Octavius exportado')
             print("  ✅ QA Octavius exportado")
+            patch_rtplan_with_correct_dose_rates(
+                export_path,
+                patient_info,
+                previous_plans=previous_plans,
+                expected_plan_label=qa_plan_label,
+                plan_description="QA Octavius"
+            )
             return export_path
     except Exception as e:
         set_progress(f'❌ Error: {e}')
@@ -810,98 +873,94 @@ def get_verification_export_path(patient_id):
     os.makedirs(export_path)
     return export_path
 
-def patch_epid_rtplan_with_correct_dose_rates(patient_info):
-    """Parchea el RTPLAN del QA EPID con las tasas de dosis correctas (600/1400 según calidad)"""
-    set_progress('Parcheando RTPLAN del QA EPID con tasas correctas...')
-    print("\n📝 Parcheando RTPLAN del QA EPID...")
-    
-    # Buscar archivos RTPLAN en la carpeta ARIA
-    plans = glob.glob(os.path.join(ARIA_PATH, "RP*.dcm"))
-    
-    if not plans or not patient_info.get('StudyInstanceUID'):
-        print("  ⚠️ No se encontraron archivos RTPLAN")
+def patch_rtplan_with_correct_dose_rates(export_path, patient_info, previous_plans=None,
+                                           expected_plan_label=None, plan_description="QA"):
+    """Parchea un RTPLAN QA con las tasas de dosis correctas (600/1400 según calidad)."""
+    set_progress(f'Parcheando RTPLAN del {plan_description} con tasas correctas...')
+    print(f"\n📝 Parcheando RTPLAN del {plan_description}...")
+
+    if not patient_info.get('StudyInstanceUID'):
+        print("  ⚠️ No se dispone de StudyInstanceUID para localizar/validar el RTPLAN")
         return False
-    
-    # Seleccionar el archivo RTPLAN más reciente (debería ser el QA EPID)
-    latest_plan = max(plans, key=os.path.getctime)
+
+    latest_plan = get_new_or_latest_rtplan(export_path, previous_plans, expected_plan_label)
+    if not latest_plan:
+        print(f"  ⚠️ No se encontraron archivos RTPLAN en {export_path}")
+        return False
+
     print(f"  📄 Modificando: {os.path.basename(latest_plan)}")
-    
-    # Crear diccionario de tasas según calidad del haz del plan original
-    dose_rates = {}
-    print("  📊 Tasas a asignar según calidad de haz:")
-    for beam in CURRENT_BEAMSET.Beams:
-        rate = get_dose_rate_for_beam(beam)
-        dose_rates[beam.Number] = rate
-        print(f"    ✓ Haz {beam.Number} ({beam.Name}, {beam.BeamQualityId}): {rate} MU/min")
-    
+
+    # Crear diccionario de tasas según calidad del haz del plan original.
+    dose_rates = build_dose_rate_map_from_current_beamset()
+    dose_rate_values_by_order = list(dose_rates.values())
+
     try:
-        # Leer el archivo DICOM
+        # Leer el archivo DICOM.
         ds = pydicom.dcmread(latest_plan)
         modified = False
-        
-        # Actualizar StudyInstanceUID si es necesario
-        if hasattr(ds, 'StudyInstanceUID') and ds.StudyInstanceUID != patient_info.get('StudyInstanceUID'):
-            ds.StudyInstanceUID = patient_info.get('StudyInstanceUID')
+
+        # Actualizar identificadores del paciente/estudio si es necesario.
+        changed, _ = set_dataset_value_if_needed(ds, 'StudyInstanceUID', patient_info.get('StudyInstanceUID'))
+        if changed:
             modified = True
             print(f"    ✓ StudyInstanceUID actualizado")
-        
-        # Actualizar PatientID si es necesario
-        if hasattr(ds, 'PatientID') and ds.PatientID != patient_info['PatientID']:
-            ds.PatientID = patient_info['PatientID']
+
+        changed, _ = set_dataset_value_if_needed(ds, 'PatientID', patient_info['PatientID'])
+        if changed:
             modified = True
             print(f"    ✓ PatientID actualizado")
-        
-        # Actualizar PatientName si es necesario
-        if hasattr(ds, 'PatientName') and ds.PatientName != patient_info['PatientName']:
-            ds.PatientName = patient_info['PatientName']
+
+        changed, _ = set_dataset_value_if_needed(ds, 'PatientName', patient_info['PatientName'])
+        if changed:
             modified = True
             print(f"    ✓ PatientName actualizado")
-        
-        # Actualizar etiqueta del plan
-        if hasattr(ds, 'RTPlanLabel') and ds.RTPlanLabel != "QA PORTAL":
-            ds.RTPlanLabel = "QA PORTAL"
-            modified = True
-            print(f"    ✏️ RTPlanLabel → QA PORTAL")
-        
-        # Recorrer los haces y asignar las tasas
+
+        # Actualizar etiqueta del plan EPID; en Octavius se conserva la etiqueta exportada.
+        if expected_plan_label and expected_plan_label == "QA PORTAL":
+            changed, _ = set_dataset_value_if_needed(ds, 'RTPlanLabel', "QA PORTAL")
+            if changed:
+                modified = True
+                print(f"    ✏️ RTPlanLabel → QA PORTAL")
+
+        # Recorrer los haces y asignar/crear las tasas de dosis.
         if hasattr(ds, 'BeamSequence'):
-            for beam in ds.BeamSequence:
-                beam_num = getattr(beam, 'BeamNumber', None)
-                
+            for beam_idx, beam in enumerate(ds.BeamSequence):
+                beam_num = normalize_beam_number(getattr(beam, 'BeamNumber', None))
+
                 if beam_num in dose_rates:
                     tasa_correcta = dose_rates[beam_num]
-                    
-                    # Modificar DoseRate en el haz
-                    if hasattr(beam, 'DoseRate'):
-                        old_rate = beam.DoseRate
-                        if str(old_rate) != str(tasa_correcta):
-                            beam.DoseRate = tasa_correcta
-                            modified = True
-                            print(f"    ✏️ Haz {beam_num}: DoseRate {old_rate} → {tasa_correcta} MU/min")
-                    
-                    # Modificar DoseRateSet en los puntos de control
-                    if hasattr(beam, 'ControlPointSequence'):
-                        for cp_idx, cp in enumerate(beam.ControlPointSequence):
-                            if hasattr(cp, 'DoseRateSet'):
-                                old_rate = cp.DoseRateSet
-                                if str(old_rate) != str(tasa_correcta):
-                                    cp.DoseRateSet = tasa_correcta
-                                    modified = True
-                                    print(f"      ↻ Haz {beam_num} CP{cp_idx+1}: DoseRateSet {old_rate} → {tasa_correcta} MU/min")
-                    
-                    # Modificar SegmentDoseRate si existe (para IMRT)
-                    if hasattr(beam, 'BeamSegmentSequence'):
-                        for seg_idx, seg in enumerate(beam.BeamSegmentSequence):
-                            if hasattr(seg, 'SegmentDoseRate'):
-                                old_rate = seg.SegmentDoseRate
-                                if str(old_rate) != str(tasa_correcta):
-                                    seg.SegmentDoseRate = tasa_correcta
-                                    modified = True
-                                    print(f"      ↻ Haz {beam_num} Segmento {seg_idx+1}: SegmentDoseRate {old_rate} → {tasa_correcta} MU/min")
+                elif beam_idx < len(dose_rate_values_by_order):
+                    tasa_correcta = dose_rate_values_by_order[beam_idx]
+                    print(f"    ⚠️ Haz DICOM {beam_num}: no coincide por número; se asigna por orden → {tasa_correcta} MU/min")
                 else:
                     print(f"    ⚠️ Haz {beam_num}: no se encontró en el plan original")
-        
-        # Guardar los cambios
+                    continue
+
+                # Algunos exportadores no crean el atributo; se añade igualmente.
+                changed, old_rate = set_dataset_value_if_needed(beam, 'DoseRate', tasa_correcta)
+                if changed:
+                    modified = True
+                    print(f"    ✏️ Haz {beam_num}: DoseRate {old_rate or 'sin valor'} → {tasa_correcta} MU/min")
+
+                # Campo estándar más importante del RTPLAN: DoseRateSet en ControlPointSequence.
+                if hasattr(beam, 'ControlPointSequence'):
+                    for cp_idx, cp in enumerate(beam.ControlPointSequence):
+                        changed, old_rate = set_dataset_value_if_needed(cp, 'DoseRateSet', tasa_correcta)
+                        if changed:
+                            modified = True
+                            print(f"      ↻ Haz {beam_num} CP{cp_idx+1}: DoseRateSet {old_rate or 'sin valor'} → {tasa_correcta} MU/min")
+
+                # Campo adicional si existe/lo requiere el destino para IMRT.
+                if hasattr(beam, 'BeamSegmentSequence'):
+                    for seg_idx, seg in enumerate(beam.BeamSegmentSequence):
+                        changed, old_rate = set_dataset_value_if_needed(seg, 'SegmentDoseRate', tasa_correcta)
+                        if changed:
+                            modified = True
+                            print(f"      ↻ Haz {beam_num} Segmento {seg_idx+1}: SegmentDoseRate {old_rate or 'sin valor'} → {tasa_correcta} MU/min")
+        else:
+            print("  ⚠️ El RTPLAN no contiene BeamSequence")
+
+        # Guardar los cambios.
         if modified:
             ds.save_as(latest_plan)
             print(f"\n  ✅ RTPLAN actualizado con tasas correctas (600/1400)")
@@ -910,11 +969,21 @@ def patch_epid_rtplan_with_correct_dose_rates(patient_info):
         else:
             print(f"\n  ✓ RTPLAN ya tenía las tasas correctas")
             return True
-            
+
     except Exception as e:
         print(f"  ❌ Error: {e}")
         set_progress(f'❌ Error actualizando RTPLAN: {e}')
         return False
+
+def patch_epid_rtplan_with_correct_dose_rates(patient_info, previous_plans=None):
+    """Parchea el RTPLAN del QA EPID en ARIA con las tasas correctas."""
+    return patch_rtplan_with_correct_dose_rates(
+        ARIA_PATH,
+        patient_info,
+        previous_plans=previous_plans,
+        expected_plan_label="QA PORTAL",
+        plan_description="QA EPID"
+    )
 
 def patch_rtimages_with_correct_uid(export_path, patient_info):
     """Parchea las imágenes RTImage exportadas con los UIDs correctos"""
@@ -1031,6 +1100,7 @@ def export_epid_qa_plan(patient_info):
         return
     
     qa_plan = CURRENT_PLAN.VerificationPlans[CURRENT_PLAN.VerificationPlans.Count - 1]
+    previous_plans = glob.glob(os.path.join(ARIA_PATH, "RP*.dcm"))
     save_all()
     
     try:
@@ -1045,7 +1115,7 @@ def export_epid_qa_plan(patient_info):
         print("  ✅ Plan QA EPID exportado")
         
         # Parchear el RTPLAN del QA EPID con las tasas correctas
-        patch_epid_rtplan_with_correct_dose_rates(patient_info)
+        patch_epid_rtplan_with_correct_dose_rates(patient_info, previous_plans=previous_plans)
                 
     except Exception as e:
         set_progress(f'❌ Error: {e}')
@@ -1101,19 +1171,18 @@ def run():
     # ========== 4. OCTAVIUS QA (SOLO SI EL USUARIO LO SOLICITA) ==========
     patient_id = get_patient_id()
     export_path = get_verification_export_path(patient_id)
+    # Obtener información DICOM antes de crear QAs para parchear cualquier RTPLAN exportado.
+    patient_info = get_patient_dicom_info()
     
     qa_octavius_name = None
     if CREATE_OCTAVIUS_QA:
         qa_octavius_name, qa_octavius_idx = create_octavius_qa()
-        export_octavius_qa_files(export_path)
+        export_octavius_qa_files(export_path, patient_info)
     else:
         print("\n⏭️ Omitiendo creación de QA Octavius (selección del usuario)")
         set_progress('Omitiendo Octavius QA')
     
     # ========== 5. EPID QA ==========
-    # Obtener información DICOM del paciente (con UIDs correctos)
-    patient_info = get_patient_dicom_info()
-    
     dose_planes, _ = create_epid_qa_plan()
     save_all()
     
@@ -1134,7 +1203,7 @@ def run():
         f"✅ EXPORTACIONES COMPLETADAS\n\n"
         f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
         f"📤 DICOM: Plan original, CT y estructuras\n"
-        f"📤 DICOM QA: Plan EPID QA (tasas: 600/1400 según calidad)\n"
+        f"📤 DICOM QA: Planes QA EPID/Octavius (tasas: 600/1400 según calidad)\n"
         f"📤 VisionRT: OK\n"
         f"📤 PACS: CT, Estructuras, DRRs\n"
         f"{octavius_msg}"
