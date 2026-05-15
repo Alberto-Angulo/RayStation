@@ -24,7 +24,8 @@ import importlib.util
 import numpy as np
 import pydicom
 
-LOCAL_UTILS = r"C:\Scripts\ray_epid_qa_utils.py"
+LOCAL_UTILS = r"C:\Program Files\RaySearch Laboratories\RayStation 2024B\ScriptClient\EPID QA\ray_epid_qa_utils.py"
+VERIFIC_PACIENTES_ROOT = r"W:\Radiofisica\Fisica\MEDIDAS\verific_pacientes"
 
 spec = importlib.util.spec_from_file_location("ray_epid_qa_utils_local", LOCAL_UTILS)
 epid_qa = importlib.util.module_from_spec(spec)
@@ -47,10 +48,28 @@ def invert_exported_dicoms(export_path):
         ds.PhotometricInterpretation = "MONOCHROME2"
         ds.save_as(fp)
 
+
+def get_patient_nhc(patient_obj):
+    possible_attrs = ["PatientID", "PatientId", "MedicalRecordNumber", "PatientNumber"]
+    for attr in possible_attrs:
+        value = getattr(patient_obj, attr, None)
+        if value:
+            return str(value).strip()
+    raise ValueError("No se pudo obtener el NHC del paciente.")
+
+
+def get_patient_export_path(patient_obj):
+    nhc = get_patient_nhc(patient_obj)
+    export_path = os.path.join(VERIFIC_PACIENTES_ROOT, nhc)
+    if not os.path.exists(export_path):
+        os.makedirs(export_path)
+    return export_path
+
 # Global and user defined variables
 machine_db = get_current('MachineDB')
 ui = get_current('ui')
 patient = get_current('Patient')
+case = get_current('Case')
 beam_set = get_current('BeamSet')
 plan = get_current('Plan')
 machine = machine_db.GetTreatmentMachine(machineName=beam_set.MachineReference.MachineName, lockMode=None)
@@ -401,9 +420,13 @@ class MyWindow(Window):
                         return
         else:
             collimator_angle = ''
-        export_path = self.export_path_combo_box.SelectedItem
-        if export_path == '':
-            MessageBox.Show('No export path selected', 'Cannot run EPID QA')
+        try:
+            export_path = get_patient_export_path(patient)
+        except Exception as exc:
+            MessageBox.Show(
+                u'No se pudo crear/usar la carpeta de exportación por NHC.\n{}'.format(exc),
+                'Cannot run EPID QA'
+            )
             return
 
         self.window.Hide()
@@ -448,6 +471,114 @@ class MyWindow(Window):
 
 def run_window(beam_set, machine):
     window = MyWindow(beam_set, machine)
+
+
+def export_qa_plan_to_aria(verification_plan):
+    qa_export_root = r"\\srvvariadicom\Dosimetrias"
+    if not os.path.exists(qa_export_root):
+        os.makedirs(qa_export_root)
+
+    # RayStation requires pending modifications to be saved before DICOM export.
+    patient.Save()
+
+    qa_beam_set = verification_plan.BeamSet
+    plan_name_candidates = [plan.Name]
+    if hasattr(verification_plan, "ForTreatmentPlan") and verification_plan.ForTreatmentPlan is not None:
+        plan_name_candidates.append(verification_plan.ForTreatmentPlan.Name)
+    plan_name_candidates = [pn for i, pn in enumerate(plan_name_candidates) if pn and pn not in plan_name_candidates[:i]]
+
+    beam_set_label = qa_beam_set.DicomPlanLabel
+    beam_set_identities = [beam_set_label] + ["{}:{}".format(pn, beam_set_label) for pn in plan_name_candidates]
+
+    export_attempts = []
+    for beam_set_identity in beam_set_identities:
+        export_attempts.append((
+            "ScriptableDicomExport_{}".format(beam_set_identity),
+            dict(
+                ExportFolderPath=qa_export_root,
+                BeamSets=[beam_set_identity],
+                PhysicalBeamSetDoseForBeamSets=[beam_set_identity],
+                PhysicalBeamDosesForBeamSets=[beam_set_identity],
+                IgnorePreConditionWarnings=True
+            )
+        ))
+        export_attempts.append((
+            "ScriptableDicomExport_{}_NoFlags".format(beam_set_identity),
+            dict(
+                ExportFolderPath=qa_export_root,
+                BeamSets=[beam_set_identity],
+                PhysicalBeamSetDoseForBeamSets=[beam_set_identity],
+                PhysicalBeamDosesForBeamSets=[beam_set_identity],
+            )
+        ))
+
+    errors = []
+    for attempt_name, kwargs in export_attempts:
+        try:
+            case.ScriptableDicomExport(**kwargs)
+            return qa_export_root
+        except Exception as exc:
+            errors.append("{}: {}".format(attempt_name, exc))
+
+    raise Exception(
+        'No se pudo exportar el QA plan (RT Plan + RT Dose) a {}.\n'
+        'BeamSet.DicomPlanLabel={}\n'
+        'Plan names usados={}\n'
+        'Errores de intentos:\n- {}'.format(qa_export_root, beam_set_label, plan_name_candidates, '\n- '.join(errors))
+    )
+
+
+def run_epid_qa_automatic():
+    selected_sid = "100 SID"
+    collimator_angle = ''
+    selected_flood_field_method_index = 0  # None
+
+    try:
+        export_path = get_patient_export_path(patient)
+    except Exception as exc:
+        MessageBox.Show(
+            u'No se pudo crear/usar la carpeta de exportación por NHC.\n{}'.format(exc),
+            'Cannot run EPID QA'
+        )
+        return
+
+    print('****************************')
+    print('     Computation started    ')
+    print('****************************')
+
+    isocenter = isocenter_values[selected_sid]
+    sid = sid_values[selected_sid]
+    machine_sad = machine.Physics.SourceAxisDistance
+    target = epid_qa.ray_epid_qa_utils if hasattr(epid_qa, "ray_epid_qa_utils") else epid_qa
+
+    qa_count_before = plan.VerificationPlans.Count
+
+    target.compute_epid_qa_response(
+        patient, plan, beam_set, grid_resolution, phantom_name, phantom_id,
+        collimator_angle, sid, isocenter, detector_plane_y, machine_sad, ui,
+        export_path, flood_field_method[selected_flood_field_method_index],
+        flood_field_beam_quality_id[selected_flood_field_method_index]
+    )
+
+    invert_exported_dicoms(export_path)
+
+    qa_count_after = plan.VerificationPlans.Count
+    if qa_count_after > qa_count_before:
+        qa_plan = plan.VerificationPlans[qa_count_after - 1]
+        try:
+            aria_export_path = export_qa_plan_to_aria(qa_plan)
+            print('QA RT Plan/RT Dose exportado en: {}'.format(aria_export_path))
+        except Exception as exc:
+            warning_msg = u'No se pudo exportar automáticamente QA RT Plan/RT Dose.\n{}'.format(exc)
+            print(warning_msg)
+            MessageBox.Show(warning_msg, 'QA export warning')
+    else:
+        print('No se encontró un nuevo QA plan para exportar a ARIA.')
+
+    print('****************************')
+    print('       Export finished      ')
+    print('****************************')
+    MessageBox.Show('Export finished', 'Export finished')
 
 
 def indent(elem, level=0):
@@ -978,7 +1109,4 @@ xaml = r"""<Window
 
 xr = XmlReader.Create(StringReader(xaml))
 
-thread = Thread(ThreadStart(lambda: run_window(beam_set, machine)))
-thread.SetApartmentState(ApartmentState.STA)
-thread.Start()
-thread.Join()
+run_epid_qa_automatic()
